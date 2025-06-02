@@ -213,8 +213,8 @@ def generate_natural_response(user_query, result_summary, _api_key):
 
 
 def main():
-    st.title("Talk to Your Data - SQL Edition")
-    st.markdown("Upload CSV data and ask questions in natural language - now with SQL queries!")
+    st.title("Talk to Your Data")
+    st.markdown("Upload CSV data and ask questions in natural language")
     
     # Check API key
     api_key = os.environ.get("GROQ_API_KEY")

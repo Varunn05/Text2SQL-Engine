@@ -50,6 +50,63 @@ def get_database_info(conn):
     return db_info
 
 
+def clear_database_and_reset():
+    """Clear database and reset all session state"""
+    try:
+        if os.path.exists(st.session_state.database_path):
+            os.remove(st.session_state.database_path)
+        
+        # Clear relevant session state
+        keys_to_clear = ['example_query', 'last_query', 'db_info_cache']
+        for key in keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+        
+        return True
+    except Exception as e:
+        st.error(f"Error clearing database: {str(e)}")
+        return False
+
+
+def delete_table(table_name):
+    """Delete a specific table from the database"""
+    try:
+        with sqlite3.connect(st.session_state.database_path) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        
+        # Clear cache
+        if 'db_info_cache' in st.session_state:
+            del st.session_state['db_info_cache']
+        
+        return True
+    except Exception as e:
+        st.error(f"Error deleting table {table_name}: {str(e)}")
+        return False
+
+
+def get_cached_database_info():
+    """Get database info with caching to avoid repeated queries"""
+    if 'db_info_cache' not in st.session_state:
+        try:
+            with sqlite3.connect(st.session_state.database_path) as conn:
+                st.session_state.db_info_cache = get_database_info(conn)
+        except:
+            st.session_state.db_info_cache = {}
+    
+    return st.session_state.db_info_cache
+
+
+def refresh_database_info():
+    """Manually refresh database info"""
+    try:
+        with sqlite3.connect(st.session_state.database_path) as conn:
+            st.session_state.db_info_cache = get_database_info(conn)
+        return True
+    except:
+        st.session_state.db_info_cache = {}
+        return False
+
+
 def create_dynamic_prompt(db_info):
     """Create a dynamic prompt based on available tables"""
     if not db_info:
@@ -232,7 +289,7 @@ def main():
                     help="Enter a name for your table (no spaces or special characters)"
                 )
                 
-                if st.button("Create Table"):
+                if st.button("Create Table", type="primary"):
                     if table_name:
                         # Clean table name
                         table_name = table_name.replace(' ', '_').replace('[^A-Za-z0-9_]', '')
@@ -240,42 +297,60 @@ def main():
                         # Create table
                         with sqlite3.connect(st.session_state.database_path) as conn:
                             columns = create_table_from_dataframe(df, table_name, conn)
-                            st.success(f"Table '{table_name}' created successfully!")
-                            st.info(f"Columns: {', '.join(columns)}")
+                            
+                        # Clear cache to refresh database info
+                        if 'db_info_cache' in st.session_state:
+                            del st.session_state['db_info_cache']
+                            
+                        st.success(f"Table '{table_name}' created successfully!")
+                        st.info(f"Columns: {', '.join(columns)}")
+                        st.rerun()
                     else:
                         st.error("Please enter a table name")
             
             except Exception as e:
                 st.error(f"Error processing file: {str(e)}")
         
+        st.divider()
+        
+        # Database management buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Clear All Data", help="Remove all tables and data"):
+                if clear_database_and_reset():
+                    st.success("Database cleared!")
+                    st.rerun()
+        
+        with col2:
+            if st.button("Refresh DB", help="Refresh database information"):
+                if refresh_database_info():
+                    st.success("Refreshed!")
+                    st.rerun()
+                else:
+                    st.error("Error refreshing database")
+        
+        st.divider()
+        
         # Show current database info
         st.subheader("Current Database")
-        try:
-            with sqlite3.connect(st.session_state.database_path) as conn:
-                db_info = get_database_info(conn)
-                
-                if db_info:
-                    for table_name, info in db_info.items():
-                        with st.expander(f"Table: {table_name}"):
-                            st.write("**Columns:**")
-                            for col, dtype in zip(info['columns'], info['types']):
-                                st.write(f"• {col} ({dtype})")
-                else:
-                    st.info("No tables found. Upload a CSV file to get started!")
+        db_info = get_cached_database_info()
         
-        except Exception as e:
-            st.error(f"Database error: {str(e)}")
-            db_info = {}
-        
-        # Clear database button
-        if st.button("Clear All Data"):
-            try:
-                if os.path.exists(st.session_state.database_path):
-                    os.remove(st.session_state.database_path)
-                st.success("Database cleared!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error clearing database: {str(e)}")
+        if db_info:
+            st.success(f"{len(db_info)} table(s) loaded")
+            
+            for table_name, info in db_info.items():
+                with st.expander(f"Table: {table_name}"):
+                    st.write("**Columns:**")
+                    for col, dtype in zip(info['columns'], info['types']):
+                        st.write(f"• {col} ({dtype})")
+                    
+                    # Individual table delete button
+                    if st.button(f"Delete {table_name}", key=f"delete_{table_name}"):
+                        if delete_table(table_name):
+                            st.success(f"Table '{table_name}' deleted!")
+                            st.rerun()
+        else:
+            st.info("No tables found. Upload a CSV file to get started!")
     
     # Main query interface
     col1, col2 = st.columns([2, 1])
@@ -283,21 +358,21 @@ def main():
     with col1:
         st.subheader("Ask Your Question")
         
-        # Check if database has tables
-        try:
-            with sqlite3.connect(st.session_state.database_path) as conn:
-                db_info = get_database_info(conn)
-        except:
-            db_info = {}
+        # Get current database info
+        db_info = get_cached_database_info()
         
         if not db_info:
             st.warning("No data available. Please upload a CSV file using the sidebar.")
-            user_query = st.text_input("Your question:", disabled=True)
+            user_query = st.text_input("Your question:", disabled=True, placeholder="Upload data first...")
             submit = st.button("Ask Question", disabled=True)
         else:
+            # Show active tables
+            table_names = list(db_info.keys())
+            st.info(f"Active tables: {', '.join(table_names)}")
+            
             # Example questions based on available tables
-            st.markdown("**Example questions you can ask:**")
-            example_table = list(db_info.keys())[0]  # Get first table name
+            st.markdown("**💡 Example questions you can ask:**")
+            example_table = table_names[0]  # Get first table name
             examples = [
                 f"How many records are in {example_table}?",
                 f"Show me all data from {example_table}",
@@ -305,14 +380,20 @@ def main():
                 "Show me the first 10 rows"
             ]
             
-            for example in examples:
-                if st.button(f"{example}", key=f"example_{example}"):
-                    st.session_state.example_query = example
+            # Create columns for example buttons
+            example_cols = st.columns(2)
+            for i, example in enumerate(examples):
+                with example_cols[i % 2]:
+                    if st.button(f"{example}", key=f"example_{i}", use_container_width=True):
+                        st.session_state.example_query = example
             
             # Query input
             default_query = st.session_state.get('example_query', '')
-            user_query = st.text_input("Your question:", value=default_query)
-            submit = st.button("Ask Question")
+            user_query = st.text_input(
+                "Your question:", 
+                value=default_query
+            )
+            submit = st.button("Ask Question", type="primary")
     
     with col2:
         st.subheader("Query Tools")
@@ -325,12 +406,14 @@ def main():
         
         # Manual SQL input
         with st.expander("Advanced: Run Custom SQL"):
-            custom_sql = st.text_area("Enter SQL query:")
+            st.markdown("*For advanced users*")
+            custom_sql = st.text_area("Enter SQL query:", placeholder="SELECT * FROM your_table LIMIT 10;")
             if st.button("Execute SQL") and custom_sql:
                 try:
                     results, columns = get_data_from_database(custom_sql, st.session_state.database_path)
                     if results:
                         df_result = pd.DataFrame(results, columns=columns)
+                        st.success(f"Found {len(results)} records")
                         st.dataframe(df_result)
                     else:
                         st.info("Query executed successfully (no results returned)")
@@ -436,7 +519,7 @@ def main():
 if __name__ == '__main__':
     # Ensure GROQ_API_KEY is set
     if not os.environ.get("GROQ_API_KEY"):
-        st.error("⚠️ GROQ_API_KEY environment variable not set!")
+        st.error("GROQ_API_KEY environment variable not set!")
         st.info("Please set your GROQ API key in the environment variables.")
         st.stop()
     

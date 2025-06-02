@@ -1,526 +1,424 @@
 import os
-import sqlite3
 import pandas as pd
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-import tempfile
 import io
+import sqlite3
+import tempfile
+import threading
 
 
-def get_table_schema(conn, table_name):
-    """Get the schema of a table"""
-    cursor = conn.cursor()
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    columns = cursor.fetchall()
-    return columns
+# Set page config first
+st.set_page_config(page_title="Text To SQL", layout="wide", initial_sidebar_state="expanded")
 
 
-def get_all_tables(conn):
-    """Get all table names in the database"""
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = cursor.fetchall()
-    return [table[0] for table in tables]
+@st.cache_data
+def process_uploaded_file(file_content, file_name):
+    """Process uploaded CSV file and return DataFrame - cached for efficiency"""
+    try:
+        df = pd.read_csv(io.StringIO(file_content))
+        # Clean column names for SQL compatibility
+        df.columns = df.columns.str.replace(' ', '_').str.replace('[^A-Za-z0-9_]', '', regex=True)
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 
-def create_table_from_dataframe(df, table_name, conn):
-    """Create a table from pandas dataframe"""
-    # Clean column names (remove spaces, special characters)
-    df.columns = df.columns.str.replace(' ', '_').str.replace('[^A-Za-z0-9_]', '', regex=True)
-    
-    # Write dataframe to SQL
-    df.to_sql(table_name, conn, if_exists='replace', index=False)
-    return df.columns.tolist()
+def get_database_connection():
+    """Get a thread-safe database connection"""
+    # Create a new connection for each thread
+    conn = sqlite3.connect(':memory:', check_same_thread=False)
+    return conn
 
 
-def get_database_info(conn):
-    """Get information about all tables and their schemas"""
-    tables = get_all_tables(conn)
-    db_info = {}
-    
-    for table in tables:
-        schema = get_table_schema(conn, table)
-        db_info[table] = {
-            'columns': [col[1] for col in schema],  # col[1] is column name
-            'types': [col[2] for col in schema]     # col[2] is column type
+def setup_database_with_data(df, table_name):
+    """Setup database with DataFrame data - returns connection"""
+    try:
+        conn = get_database_connection()
+        df.to_sql(table_name, conn, index=False, if_exists='replace')
+        return conn, None
+    except Exception as e:
+        return None, str(e)
+
+
+def get_table_info_from_dataframe(df, table_name):
+    """Get table information from DataFrame (thread-safe)"""
+    try:
+        columns = df.columns.tolist()
+        dtypes = df.dtypes.astype(str).tolist()
+        row_count = len(df)
+        sample_data = df.head(3).values.tolist()
+        
+        return {
+            'columns': columns,
+            'dtypes': dtypes,
+            'row_count': row_count,
+            'sample_data': sample_data
         }
-    
-    return db_info
-
-
-def clear_database_and_reset():
-    """Clear database and reset all session state"""
-    try:
-        if os.path.exists(st.session_state.database_path):
-            os.remove(st.session_state.database_path)
-        
-        # Clear relevant session state
-        keys_to_clear = ['example_query', 'last_query', 'db_info_cache']
-        for key in keys_to_clear:
-            if key in st.session_state:
-                del st.session_state[key]
-        
-        return True
     except Exception as e:
-        st.error(f"Error clearing database: {str(e)}")
-        return False
+        return {}
 
 
-def delete_table(table_name):
-    """Delete a specific table from the database"""
-    try:
-        with sqlite3.connect(st.session_state.database_path) as conn:
-            conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        
-        # Clear cache
-        if 'db_info_cache' in st.session_state:
-            del st.session_state['db_info_cache']
-        
-        return True
-    except Exception as e:
-        st.error(f"Error deleting table {table_name}: {str(e)}")
-        return False
-
-
-def get_cached_database_info():
-    """Get database info with caching to avoid repeated queries"""
-    if 'db_info_cache' not in st.session_state:
-        try:
-            with sqlite3.connect(st.session_state.database_path) as conn:
-                st.session_state.db_info_cache = get_database_info(conn)
-        except:
-            st.session_state.db_info_cache = {}
-    
-    return st.session_state.db_info_cache
-
-
-def refresh_database_info():
-    """Manually refresh database info"""
-    try:
-        with sqlite3.connect(st.session_state.database_path) as conn:
-            st.session_state.db_info_cache = get_database_info(conn)
-        return True
-    except:
-        st.session_state.db_info_cache = {}
-        return False
-
-
-def create_dynamic_prompt(db_info):
-    """Create a dynamic prompt based on available tables"""
-    if not db_info:
-        return """You are an expert in converting English questions to SQL query!
-                However, no tables are currently available in the database.
+def create_dynamic_sql_prompt(table_info, table_name):
+    """Create a dynamic prompt based on table structure"""
+    if not table_info:
+        return """You are an expert in converting English questions to SQL queries!
+                However, no data is currently available.
                 Please ask the user to upload a CSV file first."""
     
-    # Build table descriptions
-    table_descriptions = []
-    for table_name, info in db_info.items():
-        columns_str = ", ".join(info['columns'])
-        table_descriptions.append(f"Table '{table_name}' has columns: {columns_str}")
+    columns_str = ", ".join(table_info['columns'])
     
-    tables_info = "\n".join(table_descriptions)
+    return f"""You are an expert in converting English questions to SQL queries!
+    The table '{table_name}' has the following structure:
+    - Columns: {columns_str}
+    - Row count: {table_info['row_count']}
     
-    return f"""You are an expert in converting English questions to SQL query!
-    The SQL database contains the following tables and columns:
-    
-    {tables_info}
+    Convert the user's question into a SQL query. Return ONLY the SQL query without explanations.
     
     Examples:
-    - "How many records are in [table_name]?" → SELECT COUNT(*) FROM [table_name];
-    - "Show all data from [table_name]" → SELECT * FROM [table_name];
-    - "Find records where [column] equals [value]" → SELECT * FROM [table_name] WHERE [column] = '[value]';
+    - "How many records?" → SELECT COUNT(*) FROM {table_name}
+    - "Show first 10 rows" → SELECT * FROM {table_name} LIMIT 10
+    - "Count unique values in column X" → SELECT COUNT(DISTINCT X) FROM {table_name}
+    - "Average of column Y" → SELECT AVG(Y) FROM {table_name}
+    - "Filter where column Z > 100" → SELECT * FROM {table_name} WHERE Z > 100
+    - "Group by column A and count" → SELECT A, COUNT(*) FROM {table_name} GROUP BY A
     
     Important: 
-    - Do not include ``` or 'sql' in your response
-    - Return only valid SQL query
-    - Use exact table and column names as provided above
+    - Use '{table_name}' as the table name
+    - Return only executable SQL query
+    - Use exact column names: {columns_str}
+    - Don't use semicolon at the end
     
-    Convert this question to SQL: {{user_query}}
+    Convert this question: {{user_query}}
     """
 
 
-def get_sql_query_from_text(user_query, db_info):
-    """Generate SQL query from natural language using dynamic schema"""
-    if not db_info:
-        return "-- No tables available. Please upload a CSV file first."
+@st.cache_data
+def get_sql_query_from_text(user_query, table_info, table_name, _api_key):
+    """Generate SQL query from natural language - cached for efficiency"""
+    if not table_info:
+        return "-- No data available. Please upload a CSV file first."
     
-    prompt_template = create_dynamic_prompt(db_info)
+    prompt_template = create_dynamic_sql_prompt(table_info, table_name)
     groq_sys_prompt = ChatPromptTemplate.from_template(prompt_template)
     
-    model = "llama3-8b-8192"
     llm = ChatGroq(
-        groq_api_key=os.environ.get("GROQ_API_KEY"),
-        model_name=model
+        groq_api_key=_api_key,
+        model_name="llama3-8b-8192"
     )
     
     chain = groq_sys_prompt | llm | StrOutputParser()
-    sql_query = chain.invoke({"user_query": user_query})
     
-    return sql_query.strip()
+    try:
+        sql_query = chain.invoke({"user_query": user_query})
+        return sql_query.strip()
+    except Exception as e:
+        return f"-- Error generating query: {str(e)}"
 
 
-def generate_natural_language_response(user_query, sql_query, results, column_names):
-    """Generate natural language response based on query results"""
-    if not results:
-        return "No data found for your query."
+def execute_sql_query(query, df, table_name):
+    """Execute SQL query safely using a fresh connection"""
+    try:
+        # Remove comments and clean query
+        query = query.strip()
+        if query.startswith('--'):
+            return None, "Invalid query"
+        
+        # Create fresh connection for this query
+        conn = get_database_connection()
+        
+        # Recreate table with current data
+        df.to_sql(table_name, conn, index=False, if_exists='replace')
+        
+        # Execute the query
+        cursor = conn.execute(query)
+        
+        # Get column names
+        columns = [description[0] for description in cursor.description] if cursor.description else []
+        
+        # Fetch results
+        results = cursor.fetchall()
+        
+        # Close connection
+        conn.close()
+        
+        # Convert to DataFrame for easier handling
+        if results and columns:
+            df_result = pd.DataFrame(results, columns=columns)
+            return df_result, None
+        elif not results and columns:
+            # Query executed but no results (like COUNT that returns 0)
+            return pd.DataFrame(columns=columns), None
+        else:
+            # Non-SELECT queries (though we shouldn't have them)
+            return f"Query executed successfully", None
+        
+    except Exception as e:
+        return None, f"SQL execution error: {str(e)}"
+
+
+def format_sql_result_for_display(result, user_query):
+    """Format the SQL result for better display"""
+    if result is None:
+        return "No result to display"
     
-    # Create a summary of the results
-    result_summary = ""
-    if len(results) == 1 and len(results[0]) == 1:
-        # Single value result (like COUNT, MAX, MIN, SUM, AVG)
-        value = results[0][0]
-        result_summary = f"The answer is: **{value}**"
-    elif len(results) == 1:
-        # Single row result
-        row_data = []
-        for i, col in enumerate(column_names):
-            row_data.append(f"{col}: {results[0][i]}")
-        result_summary = f"Here's the result: {', '.join(row_data)}"
-    elif len(results) <= 5:
-        # Few rows - show all
-        result_summary = f"Found {len(results)} records:\n"
-        for i, row in enumerate(results, 1):
-            row_data = []
-            for j, col in enumerate(column_names):
-                row_data.append(f"{col}: {row[j]}")
-            result_summary += f"{i}. {', '.join(row_data)}\n"
+    # Handle different types of results
+    if isinstance(result, str):
+        return f"Result: **{result}**"
+    elif isinstance(result, pd.DataFrame):
+        if len(result) == 0:
+            return "No data found matching your criteria"
+        elif len(result) == 1 and len(result.columns) == 1:
+            # Single value result (like COUNT, AVG, etc.)
+            value = result.iloc[0, 0]
+            return f"Result: **{value}**"
+        elif len(result) == 1:
+            return f"Found 1 record:\n{result.to_string(index=False)}"
+        else:
+            return f"Found {len(result)} records"
     else:
-        # Many rows - show summary
-        result_summary = f"Found {len(results)} records. Here are the first few:\n"
-        for i, row in enumerate(results[:3], 1):
-            row_data = []
-            for j, col in enumerate(column_names):
-                row_data.append(f"{col}: {row[j]}")
-            result_summary += f"{i}. {', '.join(row_data)}\n"
-        result_summary += f"... and {len(results) - 3} more records."
-    
-    # Use LLM to generate a more natural response
+        return f"Result: {str(result)}"
+
+
+@st.cache_data
+def generate_natural_response(user_query, result_summary, _api_key):
+    """Generate natural language response - cached for efficiency"""
     response_prompt = ChatPromptTemplate.from_template("""
-    You are a helpful data analyst assistant. Based on the user's question and the query results, 
-    provide a clear, conversational answer that directly addresses what the user asked.
+    You are a helpful data analyst. Based on the user's question and SQL query results, provide a clear, conversational answer.
     
     User Question: {user_query}
-    SQL Query Used: {sql_query}
-    Results Summary: {result_summary}
+    Results: {result_summary}
     
-    Provide a natural, conversational response that answers the user's question clearly and concisely.
-    Start your response by directly answering the question, then provide additional context if helpful.
-    
-    Examples of good responses:
-    - "The highest blood pressure in your dataset is 180 mmHg."
-    - "There are 150 patients in your diabetes dataset."
-    - "The average age of patients is 45.2 years."
-    - "The most common diagnosis is Type 2 Diabetes, appearing in 85% of cases."
-    
-    Keep it conversational and helpful!
+    Provide a natural, conversational response that directly answers the question.
+    Keep it concise and helpful.
     """)
     
-    model = "llama3-8b-8192"
     llm = ChatGroq(
-        groq_api_key=os.environ.get("GROQ_API_KEY"),
-        model_name=model
+        groq_api_key=_api_key,
+        model_name="llama3-8b-8192"
     )
     
     chain = response_prompt | llm | StrOutputParser()
     
     try:
-        natural_response = chain.invoke({
+        response = chain.invoke({
             "user_query": user_query,
-            "sql_query": sql_query,
             "result_summary": result_summary
         })
-        return natural_response.strip()
-    except Exception as e:
-        # Fallback to simple response if LLM fails
+        return response.strip()
+    except:
         return result_summary
 
 
-def get_data_from_database(sql_query, database_path):
-    """Execute SQL query and return results"""
-    try:
-        with sqlite3.connect(database_path) as conn:
-            result = conn.execute(sql_query).fetchall()
-            # Also get column names
-            cursor = conn.cursor()
-            cursor.execute(sql_query)
-            column_names = [description[0] for description in cursor.description] if cursor.description else []
-            return result, column_names
-    except Exception as e:
-        st.error(f"Error executing query: {str(e)}")
-        return [], []
-
-
 def main():
-    st.set_page_config(page_title="Text To SQL", layout="wide")
-    st.title("Talk to Your Database")
-    st.markdown("Upload your CSV data and ask questions in natural language!")
+    st.title("Talk to Your Data - SQL Edition")
+    st.markdown("Upload CSV data and ask questions in natural language - now with SQL queries!")
     
-    # Initialize session state
-    if 'database_path' not in st.session_state:
-        st.session_state.database_path = "temp_database.db"
+    # Check API key
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        st.error("GROQ_API_KEY environment variable not set!")
+        st.stop()
     
-    # Sidebar for file upload and database management
+    # Initialize session state for in-memory storage
+    if 'current_data' not in st.session_state:
+        st.session_state.current_data = None
+    if 'table_name' not in st.session_state:
+        st.session_state.table_name = None
+    if 'table_info' not in st.session_state:
+        st.session_state.table_info = {}
+    
+    # Sidebar for data management
     with st.sidebar:
         st.header("Data Management")
         
-        # File upload section
+        # File upload
         uploaded_file = st.file_uploader(
             "Upload CSV file", 
             type=['csv'],
-            help="Upload a CSV file to create a new table in the database"
+            help="Upload a CSV file to analyze with SQL"
         )
         
         if uploaded_file is not None:
-            try:
-                # Read the CSV file
-                df = pd.read_csv(uploaded_file)
+            # Read file content
+            file_content = uploaded_file.getvalue().decode('utf-8')
+            file_name = uploaded_file.name.replace('.csv', '').replace(' ', '_')
+            
+            # Process file
+            df, error = process_uploaded_file(file_content, file_name)
+            
+            if error:
+                st.error(f"Error processing file: {error}")
+            else:
+                st.success(f"File loaded: {df.shape[0]} rows, {df.shape[1]} columns")
                 
                 # Show preview
-                st.subheader("Data Preview")
-                st.dataframe(df.head())
+                with st.expander("Data Preview"):
+                    st.dataframe(df.head())
                 
-                # Get table name
-                default_name = uploaded_file.name.replace('.csv', '').replace(' ', '_')
-                table_name = st.text_input(
-                    "Table name:", 
-                    value=default_name,
-                    help="Enter a name for your table (no spaces or special characters)"
-                )
+                # Table name input
+                table_name = st.text_input("Table name:", value=file_name)
                 
-                if st.button("Create Table", type="primary"):
-                    if table_name:
-                        # Clean table name
-                        table_name = table_name.replace(' ', '_').replace('[^A-Za-z0-9_]', '')
-                        
-                        # Create table
-                        with sqlite3.connect(st.session_state.database_path) as conn:
-                            columns = create_table_from_dataframe(df, table_name, conn)
-                            
-                        # Clear cache to refresh database info
-                        if 'db_info_cache' in st.session_state:
-                            del st.session_state['db_info_cache']
-                            
-                        st.success(f"Table '{table_name}' created successfully!")
-                        st.info(f"Columns: {', '.join(columns)}")
-                        st.rerun()
-                    else:
-                        st.error("Please enter a table name")
-            
-            except Exception as e:
-                st.error(f"Error processing file: {str(e)}")
-        
-        st.divider()
-        
-        # Database management buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Clear All Data", help="Remove all tables and data"):
-                if clear_database_and_reset():
-                    st.success("Database cleared!")
+                if st.button("Load Data", type="primary"):
+                    # Store data in session state
+                    st.session_state.current_data = df
+                    st.session_state.table_name = table_name
+                    st.session_state.table_info = get_table_info_from_dataframe(df, table_name)
+                    st.success(f"Table '{table_name}' loaded successfully!")
                     st.rerun()
         
-        with col2:
-            if st.button("Refresh DB", help="Refresh database information"):
-                if refresh_database_info():
-                    st.success("Refreshed!")
-                    st.rerun()
-                else:
-                    st.error("Error refreshing database")
-        
-        st.divider()
-        
-        # Show current database info
-        st.subheader("Current Database")
-        db_info = get_cached_database_info()
-        
-        if db_info:
-            st.success(f"{len(db_info)} table(s) loaded")
+        # Current data info
+        st.subheader("Current Dataset")
+        if st.session_state.current_data is not None and st.session_state.table_info:
+            info = st.session_state.table_info
+            st.success(f"Table: {st.session_state.table_name}")
+            st.info(f"Rows: {info['row_count']} | Columns: {len(info['columns'])}")
             
-            for table_name, info in db_info.items():
-                with st.expander(f"Table: {table_name}"):
-                    st.write("**Columns:**")
-                    for col, dtype in zip(info['columns'], info['types']):
-                        st.write(f"• {col} ({dtype})")
-                    
-                    # Individual table delete button
-                    if st.button(f"Delete {table_name}", key=f"delete_{table_name}"):
-                        if delete_table(table_name):
-                            st.success(f"Table '{table_name}' deleted!")
-                            st.rerun()
+            with st.expander("Column Information"):
+                for col, dtype in zip(info['columns'], info['dtypes']):
+                    st.write(f"• **{col}** ({dtype})")
+            
+            if st.button("Clear Data"):
+                st.session_state.current_data = None
+                st.session_state.table_name = None
+                st.session_state.table_info = {}
+                st.success("Data cleared!")
+                st.rerun()
         else:
-            st.info("No tables found. Upload a CSV file to get started!")
+            st.info("No data loaded. Upload a CSV file to get started.")
     
-    # Main query interface
+    # Main interface
     col1, col2 = st.columns([2, 1])
     
     with col1:
         st.subheader("Ask Your Question")
         
-        # Get current database info
-        db_info = get_cached_database_info()
-        
-        if not db_info:
-            st.warning("No data available. Please upload a CSV file using the sidebar.")
-            user_query = st.text_input("Your question:", disabled=True, placeholder="Upload data first...")
+        if st.session_state.current_data is None:
+            st.warning("Upload and load a CSV file first.")
+            user_query = st.text_input("Your question:", disabled=True)
             submit = st.button("Ask Question", disabled=True)
         else:
-            # Show active tables
-            table_names = list(db_info.keys())
-            st.info(f"Active tables: {', '.join(table_names)}")
-            
-            # Example questions based on available tables
-            st.markdown("**💡 Example questions you can ask:**")
-            example_table = table_names[0]  # Get first table name
+            # Example questions
+            st.markdown("**Example questions:**")
             examples = [
-                f"How many records are in {example_table}?",
-                f"Show me all data from {example_table}",
-                f"What are the unique values in the first column?",
-                "Show me the first 10 rows"
+                f"How many records are in the table?",
+                f"Show me the first 5 rows",
+                f"What are the column names?",
+                "Show me unique values in each column"
             ]
             
-            # Create columns for example buttons
-            example_cols = st.columns(2)
+            # Create example buttons
+            cols = st.columns(2)
             for i, example in enumerate(examples):
-                with example_cols[i % 2]:
-                    if st.button(f"{example}", key=f"example_{i}", use_container_width=True):
+                with cols[i % 2]:
+                    if st.button(example, key=f"ex_{i}", use_container_width=True):
                         st.session_state.example_query = example
             
             # Query input
             default_query = st.session_state.get('example_query', '')
-            user_query = st.text_input(
-                "Your question:", 
-                value=default_query
-            )
+            user_query = st.text_input("Your question:", value=default_query)
             submit = st.button("Ask Question", type="primary")
     
     with col2:
-        st.subheader("Query Tools")
+        st.subheader("SQL Tools")
         
-        # Show generated SQL
-        if user_query and db_info:
-            with st.expander("Generated SQL Query"):
-                sql_query = get_sql_query_from_text(user_query, db_info)
+        if st.session_state.current_data is not None and user_query:
+            with st.expander("Generated SQL"):
+                sql_query = get_sql_query_from_text(
+                    user_query, 
+                    st.session_state.table_info, 
+                    st.session_state.table_name,
+                    api_key
+                )
                 st.code(sql_query, language="sql")
         
-        # Manual SQL input
-        with st.expander("Advanced: Run Custom SQL"):
-            st.markdown("*For advanced users*")
-            custom_sql = st.text_area("Enter SQL query:", placeholder="SELECT * FROM your_table LIMIT 10;")
-            if st.button("Execute SQL") and custom_sql:
-                try:
-                    results, columns = get_data_from_database(custom_sql, st.session_state.database_path)
-                    if results:
-                        df_result = pd.DataFrame(results, columns=columns)
-                        st.success(f"Found {len(results)} records")
-                        st.dataframe(df_result)
-                    else:
-                        st.info("Query executed successfully (no results returned)")
-                except Exception as e:
-                    st.error(f"SQL Error: {str(e)}")
-    
-    # Process the main query
-    if submit and user_query and db_info:
-        with st.spinner("Analyzing your question..."):
-            try:
-                # Generate SQL query
-                sql_query = get_sql_query_from_text(user_query, db_info)
-                
-                # Execute query
-                results, columns = get_data_from_database(sql_query, st.session_state.database_path)
-                
-                # Generate natural language response
-                if results:
-                    natural_response = generate_natural_language_response(user_query, sql_query, results, columns)
+        # Manual SQL execution
+        with st.expander("Run Custom SQL"):
+            custom_sql = st.text_area("SQL query:", placeholder=f"SELECT * FROM {st.session_state.table_name or 'your_table'} LIMIT 5")
+            if st.button("Execute SQL") and custom_sql and st.session_state.current_data is not None:
+                result, error = execute_sql_query(custom_sql, st.session_state.current_data, st.session_state.table_name)
+                if error:
+                    st.error(error)
                 else:
-                    natural_response = "I couldn't find any data matching your question."
-                
-                # Display results
-                st.subheader("Answer")
-                
-                # Main answer in a highlighted box
-                st.success(f"**{natural_response}**")
-                
-                # Technical details in expandable section
-                with st.expander("Technical Details", expanded=False):
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.code(sql_query, language="sql")
-                    with col2:
-                        st.metric("Records Found", len(results))
-                
-                # Data display section
-                if results:
-                    st.subheader("Data Details")
-                    
-                    # Convert to DataFrame for better display
-                    df_result = pd.DataFrame(results, columns=columns)
-                    
-                    # Smart display based on result size
-                    if len(results) == 1 and len(columns) == 1:
-                        # Single value - already shown in natural response
-                        st.info("ℹSingle value result shown above")
-                    elif len(results) <= 10:
-                        # Small result set - show as table
-                        st.dataframe(df_result, use_container_width=True)
+                    if isinstance(result, pd.DataFrame):
+                        st.dataframe(result)
                     else:
-                        # Large result set - show with options
+                        st.write(result)
+    
+    # Process main query
+    if submit and user_query and st.session_state.current_data is not None:
+        with st.spinner("Processing your question..."):
+            # Generate SQL query
+            sql_query = get_sql_query_from_text(
+                user_query, 
+                st.session_state.table_info, 
+                st.session_state.table_name,
+                api_key
+            )
+            
+            # Execute SQL query
+            result, error = execute_sql_query(sql_query, st.session_state.current_data, st.session_state.table_name)
+            
+            if error:
+                st.error(f"Error: {error}")
+                st.write("**Troubleshooting:**")
+                st.write("- Check if column names are correct")
+                st.write("- Try rephrasing your question")
+                st.write("- View column information in the sidebar")
+                st.write("- Check the generated SQL query above")
+            else:
+                # Format and display results
+                result_summary = format_sql_result_for_display(result, user_query)
+                
+                # Generate natural response
+                natural_response = generate_natural_response(user_query, result_summary, api_key)
+                
+                # Display answer
+                st.subheader("Answer")
+                st.success(natural_response)
+                
+                # Show detailed results
+                if isinstance(result, pd.DataFrame) and len(result) > 0:
+                    st.subheader("Query Results")
+                    
+                    if len(result) <= 20:
+                        st.dataframe(result, use_container_width=True)
+                    else:
                         display_option = st.radio(
-                            "Choose display format:",
-                            ["First 10 rows", "All data", "Summary statistics"],
+                            "Display options:",
+                            ["First 20 rows", "Last 20 rows", "Summary stats"],
                             horizontal=True
                         )
                         
-                        if display_option == "First 10 rows":
-                            st.dataframe(df_result.head(10), use_container_width=True)
-                            if len(results) > 10:
-                                st.info(f"Showing first 10 of {len(results)} records")
-                        elif display_option == "All data":
-                            st.dataframe(df_result, use_container_width=True)
+                        if display_option == "First 20 rows":
+                            st.dataframe(result.head(20), use_container_width=True)
+                        elif display_option == "Last 20 rows":
+                            st.dataframe(result.tail(20), use_container_width=True)
                         else:
-                            # Show summary statistics for numeric columns
-                            numeric_cols = df_result.select_dtypes(include=['number']).columns
+                            numeric_cols = result.select_dtypes(include=['number']).columns
                             if len(numeric_cols) > 0:
-                                st.write("**Summary Statistics:**")
-                                st.dataframe(df_result[numeric_cols].describe())
+                                st.dataframe(result[numeric_cols].describe())
                             else:
-                                st.info("No numeric columns found for statistics")
+                                st.info("No numeric columns for statistics")
                     
                     # Download option
-                    csv = df_result.to_csv(index=False)
-                    st.download_button(
-                        label="Download Results as CSV",
-                        data=csv,
-                        file_name="query_results.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("No data found matching your criteria.")
-                    st.write("**Suggestions:**")
-                    st.write("- Check if the column names are spelled correctly")
-                    st.write("- Try a broader search term")
-                    st.write("- View your table structure in the sidebar")
-                    
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.write("**Troubleshooting tips:**")
-                st.write("- Make sure your question relates to the uploaded data")
-                st.write("- Check column names in the sidebar")
-                st.write("- Try rephrasing your question")
+                    if len(result) > 0:
+                        csv = result.to_csv(index=False)
+                        st.download_button(
+                            "Download Results",
+                            csv,
+                            "sql_results.csv",
+                            "text/csv"
+                        )
                 
-                # Show available tables for debugging
-                if db_info:
-                    st.write("**Available tables and columns:**")
-                    for table_name, info in db_info.items():
-                        st.write(f"- **{table_name}**: {', '.join(info['columns'])}")
+                # Technical details
+                with st.expander("Technical Details"):
+                    st.code(sql_query, language="sql")
+                    if isinstance(result, pd.DataFrame):
+                        st.write(f"Result shape: {result.shape}")
 
 
 if __name__ == '__main__':
-    # Ensure GROQ_API_KEY is set
-    if not os.environ.get("GROQ_API_KEY"):
-        st.error("GROQ_API_KEY environment variable not set!")
-        st.info("Please set your GROQ API key in the environment variables.")
-        st.stop()
-    
     main()

@@ -1,0 +1,7 @@
+streamlit
+langchain-groq
+langchain-core
+pandas
+sqlite3
+tempfile
+io

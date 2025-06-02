@@ -4,6 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+streamlit = "*"
+langchain-groq = "*"
+langchain-core = "*"
+sqlite3 = "*"
+tempfile = "*"
+io = "*"
 
 [dev-packages]
 
